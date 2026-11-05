@@ -56,7 +56,7 @@ STATE_FILE = CONFIG / "state.json"
 LOG_DIR = CONFIG / "logs"
 _lock = threading.Lock()  # one backup at a time
 _state_lock = threading.Lock()
-_seen = {"unauthorized": [], "connected": {}}  # latest poll, for the status page and metrics
+_seen = {"ready": {}, "unauthorized": [], "connected": {}}  # latest poll
 
 
 def log(msg):
@@ -476,20 +476,26 @@ def due(serial):
             and now - s.get("last_attempt", 0) >= RETRY_MINUTES * 60)
 
 
-def watcher():
-    """Back up whichever devices are present and due; a plugged-in device is picked up within a poll."""
+def poller():
+    """Keep the device list fresh, also during a backup, so a newly plugged-in device shows up at once."""
     last_connect = 0
     while True:
         if TARGETS and time.time() - last_connect >= CONNECT_EVERY:
             connect_targets()
             last_connect = time.time()
         ready, unauthorized = list_devices()
-        _seen.update(unauthorized=unauthorized, connected={s: transport_of(a) for s, a in ready.items()})
-        for serial, a in ready.items():
+        _seen.update(ready=ready, unauthorized=unauthorized, connected={s: transport_of(a) for s, a in ready.items()})
+        time.sleep(POLL_SECONDS)
+
+
+def watcher():
+    """Back up whichever devices are present and due, one at a time."""
+    while True:
+        for serial, a in dict(_seen["ready"]).items():
             if due(serial):
                 with _lock:
                     backup_one(serial, a)
-        time.sleep(POLL_SECONDS)
+        time.sleep(5)
 
 
 def run_now(serials=None):
@@ -622,6 +628,7 @@ def cmd_serve(_args):
         if st:
             STATE_FILE.write_text(json.dumps(st, indent=1, sort_keys=True))
     adb("start-server", timeout=30)
+    threading.Thread(target=poller, daemon=True).start()
     threading.Thread(target=watcher, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
