@@ -4,6 +4,7 @@ Any authorised device that is plugged in, or reachable at an ADB_TARGETS address
 once every BACKUP_INTERVAL_HOURS. Each device gets <backup dir>/<model>-<serial>/:
 
   files/       mirror of shared storage (/sdcard). Files deleted on the phone are kept here.
+  sd-<id>/     the same for an SD card, if there is one
   apks/        <package>/<versionCode>/*.apk for every user-installed app
   snapshots/   <date>/ contacts.vcf, sms.xml, calls.xml, packages.txt, settings and getprop
 
@@ -38,11 +39,11 @@ CONFIG = Path(os.environ.get("CONFIG_DIR", "/config"))
 BACKUPS = Path(os.environ.get("BACKUP_DIR", "/backups"))
 INTERVAL_HOURS = float(os.environ.get("BACKUP_INTERVAL_HOURS", "24"))
 RETRY_MINUTES = float(os.environ.get("RETRY_MINUTES", "60"))
-BACKUP_TIMEOUT_HOURS = float(os.environ.get("BACKUP_TIMEOUT_HOURS", "12"))
 TARGETS = [t.strip() for t in os.environ.get("ADB_TARGETS", "").split(",") if t.strip()]
 SERIALS = {s.strip() for s in os.environ.get("SERIALS", "").split(",") if s.strip()}
 EXCLUDE = re.compile(os.environ.get(
-    "EXCLUDE", r"^Android/obb/|^Android/data/[^/]+/cache/|(^|/)\.thumbnails/|(^|/)\.Trash"))
+    "EXCLUDE", r"^Android/obb/|^Android/data/[^/]+/cache/|(^|/)\.thumbnails/|(^|/)\.Trash|^\.trash-storage/"
+    r"|^\.Spotlight-V100/|^\.fseventsd/|^LOST\.DIR/"))
 KEEP_SNAPSHOTS = int(os.environ.get("KEEP_SNAPSHOTS", "30"))
 PORT = int(os.environ.get("PORT", "9872"))
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
@@ -161,19 +162,39 @@ class Disconnected(Exception):
     pass
 
 
-STAT_RE = re.compile(r"^(\d+) (\d+) /sdcard/(.+)$")
+STAT_RE = re.compile(r"^(\d+) (\d+) (.+)$")
 
 
-def list_files(a):
-    """[(size, mtime, relative path)] of shared storage; raises if it can't be read at all."""
-    r = shell(a, "find /sdcard/ -type f -exec stat -c '%s %Y %n' {} + 2>/dev/null", timeout=1800)
-    out = []
-    for line in r.stdout.splitlines():
-        m = STAT_RE.match(line)
-        if m and not EXCLUDE.search(m.group(3)):
-            out.append((int(m.group(1)), int(m.group(2)), m.group(3)))
-    if not out:  # before the first unlock after a reboot, shared storage is encrypted and looks empty
+def storage_roots(a):
+    """[(device path, backup folder)]: shared storage, then any SD card."""
+    roots = [("/sdcard/", "files")]
+    for name in shell(a, "ls /storage", timeout=60).stdout.split():
+        if name not in ("emulated", "self"):
+            roots.append((f"/storage/{name}/", f"sd-{name}"))
+    return roots
+
+
+def list_files(a, root):
+    """[(size, mtime, relative path)] under root; raises if the listing is empty or comes up short.
+
+    Piped through xargs: `find -exec stat {} +` stops with "Argument list too long" on a big
+    tree and silently returns a partial list.
+    """
+    found = shell(a, f"find {root} -type f 2>/dev/null | wc -l", timeout=1800).stdout.strip()
+    r = shell(a, f"find {root} -type f -print0 2>/dev/null | xargs -0 stat -c '%s %Y %n' 2>/dev/null", timeout=1800)
+    lines = r.stdout.splitlines()
+    expected = int(found) if found.isdigit() else 0
+    if len(lines) < expected - max(10, expected // 100):  # a few files can vanish between the two commands
+        raise RuntimeError(f"incomplete listing of {root}: {len(lines)} of {expected} files")
+    if root == "/sdcard/" and not lines:  # before the first unlock after a reboot, shared storage looks empty
         raise RuntimeError("shared storage is empty or unreadable (unlock the phone once after a reboot)")
+    out = []
+    for line in lines:
+        m = STAT_RE.match(line)
+        if m and m.group(3).startswith(root):
+            rel = m.group(3)[len(root):]
+            if not EXCLUDE.search(rel):
+                out.append((int(m.group(1)), int(m.group(2)), rel))
     return out
 
 
@@ -195,29 +216,29 @@ def pull(a, remote, dest, size=0):
 
 
 def sync_files(a, serial, top, lf):
-    files = list_files(a)
-    root = top / "files"
-    todo = []
-    for size, mtime, rel in files:
-        local = root / rel
-        try:
-            st = local.stat()
-            if st.st_size == size and abs(st.st_mtime - mtime) <= 1:
-                continue
-        except OSError:
-            pass
-        todo.append((size, rel))
-    total = sum(s for s, _ in todo) or 1
+    todo, n_files = [], 0
+    for root, folder in storage_roots(a):
+        files = list_files(a, root)
+        n_files += len(files)
+        for size, mtime, rel in files:
+            try:
+                st = (top / folder / rel).stat()
+                if st.st_size == size and abs(st.st_mtime - mtime) <= 1:
+                    continue
+            except OSError:
+                pass
+            todo.append((size, root, folder, rel))
+    total = sum(t[0] for t in todo) or 1
     done = copied = failed = 0
-    log(f"{serial}: {len(files)} files on the device, {len(todo)} to copy ({total / 1e9:.2f} GB)")
+    log(f"{serial}: {n_files} files on the device, {len(todo)} to copy ({total / 1e9:.2f} GB)")
     last_pct = -1
-    for size, rel in todo:
-        err = pull(a, "/sdcard/" + rel, root / rel, size)
+    for size, root, folder, rel in todo:
+        err = pull(a, root + rel, top / folder / rel, size)
         if err:
             if not online(a):
                 raise Disconnected("device went away during the file copy")
             failed += 1
-            lf.write(f"FAILED {rel}: {err}\n".encode(errors="surrogateescape"))
+            lf.write(f"FAILED {root}{rel}: {err}\n".encode(errors="surrogateescape"))
         else:
             copied += 1
         done += size
@@ -225,7 +246,7 @@ def sync_files(a, serial, top, lf):
         if pct != last_pct:
             last_pct = pct
             update_state(serial, progress=pct)
-    return len(files), copied, failed, done
+    return n_files, copied, failed, done
 
 
 PKG_RE = re.compile(r"^package:(\S+) versionCode:(\d+)")

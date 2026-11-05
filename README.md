@@ -13,12 +13,13 @@ Any authorised device that's connected gets one backup every `BACKUP_INTERVAL_HO
 | Folder | Contents | Restore with |
 |---|---|---|
 | `files/` | Everything in shared storage: photos, downloads, documents, `Android/media`, `Android/data` | Copy back |
+| `sd-<id>/` | The same for an SD card, if there is one | Copy back |
 | `apks/<package>/<versionCode>/` | Every user-installed app, including split APKs | `adb install-multiple` |
 | `snapshots/<date>/contacts.vcf` | Contacts, without photos | Any contacts app |
 | `snapshots/<date>/sms.xml`, `calls.xml` | SMS text messages and call log | [SMS Backup & Restore](https://www.synctech.com.au/sms-backup-restore/) format |
 | `snapshots/<date>/` | Package list, settings, `getprop` | Reference |
 
-- **`files/` never deletes.** A file deleted on the phone stays in the backup, so the folder
+- **`files/` and `sd-<id>/` never delete.** A file deleted on the phone stays in the backup, so the folder
   only grows. A file changed on the phone overwrites the old copy.
 - The last `KEEP_SNAPSHOTS` days of snapshots are kept (default 30).
 - A file is copied again if its size or modification time has changed. Unplugging mid-run is
@@ -29,7 +30,8 @@ Any authorised device that's connected gets one backup every `BACKUP_INTERVAL_HO
 **Private app data can't be backed up without root.** That means logins, app databases and
 chat histories kept inside apps. `adb backup` doesn't help: Android 12 and later exclude almost
 every app from it. After a restore, apps come back but start logged out. Apps that keep their
-own exports in shared storage are covered by `files/`.
+own exports in shared storage are covered by `files/`. This can be most of a device: a tablet
+with 209 GB used had 178 GB of private app data, whatever the apps keep privately.
 
 MMS messages and contact photos aren't included. The backups aren't encrypted, so keep them on
 a private share. `snapshots/` holds your messages and contacts in plain text.
@@ -79,7 +81,7 @@ still can't use it unless the device has authorised their key.
 | `RETRY_MINUTES` | `60` | Wait after a failed attempt |
 | `ADB_TARGETS` | | Comma list of `host:port` to connect to |
 | `SERIALS` | | Comma list; only back up these devices |
-| `EXCLUDE` | caches, thumbnails, `Android/obb/` | Regex matched against paths relative to `/sdcard` |
+| `EXCLUDE` | caches, thumbnails, `Android/obb/` | Regex matched against paths relative to `/sdcard` or the SD card |
 | `KEEP_SNAPSHOTS` | `30` | Dated snapshots to keep per device |
 | `DISCORD_WEBHOOK_URL` | | Alert on failed backups |
 | `NOTIFY_SUCCESS` | `false` | Also post successful backups |
