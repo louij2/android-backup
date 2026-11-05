@@ -14,7 +14,9 @@ COPY android-backup /usr/local/bin/android-backup
 RUN chmod +x /usr/local/bin/android-backup
 
 # HOME=/config keeps the adb key across recreates. PYTHONUTF8: phones have non-ASCII file names.
-ENV PYTHONPATH=/app PYTHONUNBUFFERED=1 PYTHONUTF8=1 HOME=/config \
+# ADB_LIBUSB=0: libusb hotplug needs kernel events, which don't reach a bridged container, so a device
+# plugged in after startup went unseen. adb's native backend polls /dev/bus/usb instead.
+ENV PYTHONPATH=/app PYTHONUNBUFFERED=1 PYTHONUTF8=1 HOME=/config ADB_LIBUSB=0 \
     BACKUP_DIR=/backups CONFIG_DIR=/config PORT=9872
 VOLUME ["/backups", "/config"]
 EXPOSE 9872
