@@ -125,10 +125,15 @@ def list_devices():
             unauthorized.append(address)
         elif status == "device":
             try:
-                serial = shell(address, "getprop ro.serialno", timeout=20).stdout.strip() or address
+                serial = shell(address, "getprop ro.serialno", timeout=20).stdout.strip()
             except subprocess.TimeoutExpired:
                 continue
-            is_network = ":" in address or "._tcp" in address
+            is_network = transport_of(address) == "wifi"
+            if not serial:  # a USB address is the serial; a network one would back the device up twice
+                if is_network:
+                    log(f"{address}: no serial number yet, skipping this poll")
+                    continue
+                serial = address
             if serial not in ready or not is_network:
                 ready[serial] = address
     return ({s: a for s, a in ready.items() if not SERIALS or s in SERIALS}, unauthorized)
