@@ -29,6 +29,7 @@
   <Config Name="Discord webhook" Target="DISCORD_WEBHOOK_URL" Default="" Mode="" Description="Optional: alert on failed backups" Type="Variable" Display="always" Required="false" Mask="true"/>
   <Config Name="Notify on success" Target="NOTIFY_SUCCESS" Default="false" Mode="" Description="true = also post successful backups" Type="Variable" Display="advanced" Required="false" Mask="false">false</Config>
   <Config Name="Retry minutes" Target="RETRY_MINUTES" Default="60" Mode="" Description="Wait after a failed attempt" Type="Variable" Display="advanced" Required="false" Mask="false">60</Config>
+  <Config Name="Mobile data limit (MB)" Target="MOBILE_DATA_LIMIT_MB" Default="500" Mode="" Description="On mobile data (e.g. Tailscale over LTE) a backup copies new files up to this much, plus contacts/SMS; app updates and the rest wait for Wi-Fi" Type="Variable" Display="advanced" Required="false" Mask="false">500</Config>
   <Config Name="Snapshots to keep" Target="KEEP_SNAPSHOTS" Default="30" Mode="" Description="Dated contacts/SMS/settings snapshots per device" Type="Variable" Display="advanced" Required="false" Mask="false">30</Config>
   <Config Name="Only these serials" Target="SERIALS" Default="" Mode="" Description="Optional comma list; default = every authorised device" Type="Variable" Display="advanced" Required="false" Mask="false"/>
 </Container>

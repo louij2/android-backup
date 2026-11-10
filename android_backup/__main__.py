@@ -45,6 +45,7 @@ EXCLUDE = re.compile(os.environ.get(
     "EXCLUDE", r"^Android/obb/|^Android/data/[^/]+/cache/|(^|/)\.thumbnails/|(^|/)\.Trash|^\.trash-storage/"
     r"|^\.Spotlight-V100/|^\.fseventsd/|^LOST\.DIR/"))
 KEEP_SNAPSHOTS = int(os.environ.get("KEEP_SNAPSHOTS", "30"))
+MOBILE_LIMIT = float(os.environ.get("MOBILE_DATA_LIMIT_MB", "500")) * 1e6
 PORT = int(os.environ.get("PORT", "9872"))
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 NOTIFY_SUCCESS = os.environ.get("NOTIFY_SUCCESS", "false").lower() in ("1", "true", "yes")
@@ -143,6 +144,27 @@ def transport_of(address):
     return "wifi" if ":" in address or "._tcp" in address else "usb"
 
 
+def on_mobile_data(a):
+    """True when a device reached over the network isn't on Wi-Fi (Tailscale over mobile data).
+
+    If the check itself fails, assume mobile data: a cut-down backup is the safe mistake.
+    """
+    if transport_of(a) == "usb":
+        return False
+    try:
+        out = shell(a, "cmd wifi status 2>/dev/null; dumpsys wifi 2>/dev/null | grep -m1 mNetworkInfo", timeout=60).stdout
+    except subprocess.TimeoutExpired:
+        return True
+    return not ("Wifi is connected" in out or "state: CONNECTED" in out)
+
+
+def usb_nodes():
+    try:
+        return {f"{bus.name}/{dev.name}" for bus in Path("/dev/bus/usb").iterdir() for dev in bus.iterdir()}
+    except OSError:
+        return set()
+
+
 def device_label(adb_serial, serial):
     model = shell(adb_serial, "getprop ro.product.model", timeout=20).stdout.strip() or "android"
     return re.sub(r"[^A-Za-z0-9._-]+", "_", model) + "-" + re.sub(r"[^A-Za-z0-9._-]+", "_", serial)
@@ -220,7 +242,8 @@ def pull(a, remote, dest, size=0):
     return None
 
 
-def sync_files(a, serial, top, lf):
+def sync_files(a, serial, top, lf, limit=None):
+    """Copy new and changed files. With a byte limit, files past it wait for the next run."""
     todo, n_files = [], 0
     for root, folder in storage_roots(a):
         files = list_files(a, root)
@@ -233,9 +256,20 @@ def sync_files(a, serial, top, lf):
             except OSError:
                 pass
             todo.append((size, root, folder, rel))
+    deferred = 0
+    if limit is not None:
+        kept, budget = [], limit
+        for t in sorted(todo, key=lambda t: t[0]):  # smallest first, so one big video doesn't hold back the rest
+            if t[0] <= budget:
+                kept.append(t)
+                budget -= t[0]
+            else:
+                deferred += t[0]
+        todo = kept
     total = sum(t[0] for t in todo) or 1
     done = copied = failed = 0
-    log(f"{serial}: {n_files} files on the device, {len(todo)} to copy ({total / 1e9:.2f} GB)")
+    log(f"{serial}: {n_files} files on the device, {len(todo)} to copy ({total / 1e9:.2f} GB)"
+        + (f", {deferred / 1e9:.2f} GB waiting for Wi-Fi" if deferred else ""))
     last_pct = -1
     for size, root, folder, rel in todo:
         err = pull(a, root + rel, top / folder / rel, size)
@@ -251,7 +285,7 @@ def sync_files(a, serial, top, lf):
         if pct != last_pct:
             last_pct = pct
             update_state(serial, progress=pct)
-    return n_files, copied, failed, done
+    return n_files, copied, failed, done, deferred
 
 
 PKG_RE = re.compile(r"^package:(\S+) versionCode:(\d+)")
@@ -460,15 +494,22 @@ def backup_one(serial, a):
     logfile = LOG_DIR / f"{label}-{dt.datetime.now():%Y%m%d-%H%M%S}.log"
     started = time.time()
     transport = transport_of(a)
+    light = on_mobile_data(a)
     update_state(serial, name=label, running=True, last_attempt=started, transport=transport, progress=0)
-    log(f"{label}: backup starting over {transport}")
+    log(f"{label}: backup starting over {transport}" + (" (mobile data: light mode)" if light else ""))
     gone = False
     try:
         with open(logfile, "wb") as lf:
-            n_files, copied, failed, copied_bytes = sync_files(a, serial, top, lf)
-            apks, apk_failed = sync_apks(a, top, lf)
+            n_files, copied, failed, copied_bytes, deferred = sync_files(
+                a, serial, top, lf, limit=MOBILE_LIMIT if light else None)
+            apks, apk_failed = (0, 0) if light else sync_apks(a, top, lf)
             counts, problems = snapshot(a, top, lf)
-        parts = [f"{n_files} files ({copied} new, {copied_bytes / 1e9:.2f} GB)", f"{apks} new APKs"]
+        parts = ["light mode (mobile data): apps wait for Wi-Fi"] if light else []
+        parts += [f"{n_files} files ({copied} new, {copied_bytes / 1e9:.2f} GB)"]
+        if deferred:
+            parts.append(f"{deferred / 1e9:.2f} GB of files wait for Wi-Fi")
+        if not light:
+            parts.append(f"{apks} new APKs")
         parts += [f"{v} {k}" for k, v in counts.items()]
         if failed or apk_failed:
             parts.append(f"{failed} files + {apk_failed} APKs could not be read")
@@ -476,7 +517,8 @@ def backup_one(serial, a):
             parts.append("no " + ", ".join(problems))
         message, ok = "; ".join(parts), True
         fields = dict(last_success=time.time(), files=n_files, files_failed=failed, apks_failed=apk_failed,
-                      copied_bytes=copied_bytes, snapshot_problems=len(problems), progress=100)
+                      copied_bytes=copied_bytes, snapshot_problems=len(problems), progress=100, light=light,
+                      deferred_bytes=deferred)
     except Disconnected as e:
         message, ok, gone, fields = str(e), False, True, {}
     except (RuntimeError, subprocess.SubprocessError, OSError) as e:
@@ -495,17 +537,35 @@ def backup_one(serial, a):
     return ok
 
 
-def due(serial):
+def due(serial, a):
+    """Every BACKUP_INTERVAL_HOURS, or straight away once a light-mode device is off mobile data again."""
     s = load_state().get(serial, {})
     now = time.time()
-    return (now - s.get("last_success", 0) >= INTERVAL_HOURS * 3600
-            and now - s.get("last_attempt", 0) >= RETRY_MINUTES * 60)
+    if now - s.get("last_attempt", 0) < RETRY_MINUTES * 60:
+        return False
+    if now - s.get("last_success", 0) >= INTERVAL_HOURS * 3600:
+        return True
+    return bool(s.get("light")) and not on_mobile_data(a)
 
 
 def poller():
     """Keep the device list fresh, also during a backup, so a newly plugged-in device shows up at once."""
-    last_connect = 0
+    last_connect, known_usb = 0, usb_nodes()
     while True:
+        nodes = usb_nodes()
+        # adb's libusb backend never hears about hotplug inside a container, so restart it to rescan
+        # when something is plugged in. Not during a backup: that would cut it off.
+        if nodes - known_usb and _lock.acquire(blocking=False):
+            try:
+                log("new USB device: restarting adb to pick it up")
+                adb("kill-server", timeout=30)
+                adb("start-server", timeout=30)
+                last_connect = 0
+            finally:
+                _lock.release()
+            known_usb = nodes
+        elif not nodes - known_usb:
+            known_usb = nodes
         if TARGETS and time.time() - last_connect >= CONNECT_EVERY:
             connect_targets()
             last_connect = time.time()
@@ -518,7 +578,7 @@ def watcher():
     """Back up whichever devices are present and due, one at a time."""
     while True:
         for serial, a in dict(_seen["ready"]).items():
-            if due(serial):
+            if due(serial, a):
                 with _lock:
                     backup_one(serial, a)
         time.sleep(5)
@@ -561,7 +621,7 @@ def metrics():
         for serial, s in st.items():
             if key in s:
                 lines.append(f'android_backup_{metric}{{serial="{label_escape(serial)}",name="{label_escape(s.get("name", serial))}"}} {s[key]}')
-    for name in ("last_ok", "running", "progress_percent", "connected", "safe_to_unplug"):
+    for name in ("last_ok", "running", "progress_percent", "connected", "safe_to_unplug", "light_mode", "deferred_bytes"):
         lines.append(f"# TYPE android_backup_{name} gauge")
     for serial, s in st.items():
         lab = f'serial="{label_escape(serial)}",name="{label_escape(s.get("name", serial))}"'
@@ -572,6 +632,8 @@ def metrics():
         lines.append(f"android_backup_progress_percent{{{lab}}} {s.get('progress', 0) if running else 0}")
         lines.append(f"android_backup_connected{{{lab}}} {1 if serial in _seen['connected'] else 0}")
         lines.append(f"android_backup_safe_to_unplug{{{lab}}} {0 if running and s.get('transport') == 'usb' else 1}")
+        lines.append(f"android_backup_light_mode{{{lab}}} {1 if s.get('light') else 0}")
+        lines.append(f"android_backup_deferred_bytes{{{lab}}} {s.get('deferred_bytes', 0)}")
     return "\n".join(lines) + "\n"
 
 

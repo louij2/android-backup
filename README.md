@@ -73,6 +73,16 @@ Add `<device ip>:5555` to `ADB_TARGETS`. Android forgets `tcpip 5555` when it re
 that command after a reboot. Anyone on the network can then reach the device's ADB port, but they
 still can't use it unless the device has authorised their key.
 
+## Mobile data (light mode)
+
+A device reached over the network that isn't on Wi-Fi, such as a tablet on Tailscale over LTE,
+gets a light backup: new files up to `MOBILE_DATA_LIMIT_MB` (smallest first) and the contacts,
+SMS and settings snapshot. App updates and bigger files wait. As soon as the device is back on
+Wi-Fi or USB it gets a full backup, without waiting for the next interval.
+
+App updates are most of the data: a phone with 51 apps averaged about 0.5 GB a day of updates,
+while its changed files came to 30-50 MB.
+
 ## Settings
 
 | Variable | Default | |
@@ -82,6 +92,7 @@ still can't use it unless the device has authorised their key.
 | `ADB_TARGETS` | | Comma list of `host:port` to connect to |
 | `SERIALS` | | Comma list; only back up these devices |
 | `EXCLUDE` | caches, thumbnails, `Android/obb/` | Regex matched against paths relative to `/sdcard` or the SD card |
+| `MOBILE_DATA_LIMIT_MB` | `500` | Most new-file data per backup on mobile data |
 | `KEEP_SNAPSHOTS` | `30` | Dated snapshots to keep per device |
 | `DISCORD_WEBHOOK_URL` | | Alert on failed backups |
 | `NOTIFY_SUCCESS` | `false` | Also post successful backups |
